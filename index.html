@@ -1,1 +1,257 @@
 
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ortplacerare</title>
+<style>
+  body{font-family:system-ui,Arial,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;background:#f6f6f6;margin:0}
+  .app{background:#fff;padding:22px;border-radius:14px;box-shadow:0 10px 30px rgba(0,0,0,.1);width:92%;max-width:420px}
+  input,button{width:100%;padding:14px;font-size:18px;margin-top:10px}
+  #result{margin-top:16px;font-size:20px;text-align:center;min-height:28px}
+</style>
+</head>
+
+<body>
+  <div class="app">
+    <input id="city" placeholder="Skriv stad/ort…" autocomplete="off">
+    <button onclick="findCity()">Sök</button>
+    <button onclick="resetApp()">Reset</button>
+    <div id="result"></div>
+  </div>
+
+<script>
+/* ===== Settings ===== */
+const MIN_POP = 1000;
+const PREFER_POP = 3000;
+
+const IDEAL_MIN = 30*60;
+const IDEAL_MAX = 45*60;
+
+const MAX_DEFAULT = 60*60;
+const MAX_SPARSE  = 90*60;
+
+const RADIUS_KM = 240;
+const WIKIDATA_LIMIT = 260;
+const OSRM_TABLE_LIMIT = 90;
+
+const SPARSE_COUNTIES = new Set([
+  "Norrbottens län","Västerbottens län","Jämtlands län","Västernorrlands län","Gävleborgs län"
+]);
+
+/* ===== UI ===== */
+function show(msg){ document.getElementById("result").textContent = msg; }
+function resetApp(){ document.getElementById("city").value = ""; show(""); }
+function getFixedFromUrl(){
+  const u = new URL(window.location.href);
+  const v = u.searchParams.get("fixed");
+  return v ? v.trim() : "";
+}
+function metersToKm(m){ return Math.round((m||0)/1000); }
+function n(s){ return (s||"").trim().toLowerCase(); }
+
+/* ===== Haversine (for candidate sampling) ===== */
+function haversineKm(lat1, lon1, lat2, lon2){
+  const R = 6371;
+  const toRad = x => x * Math.PI/180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+/* ===== Nominatim ===== */
+async function nominatimSearch(name){
+  const q = encodeURIComponent(name + ", Sverige");
+  const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&addressdetails=1&q=${q}`;
+  const r = await fetch(url, { headers: { "Accept":"application/json" }});
+  if(!r.ok) throw new Error("Nominatim fel");
+  const j = await r.json();
+  if(!j.length) throw new Error("Ingen plats hittades");
+  const a = j[0].address || {};
+  return {
+    lat: +j[0].lat,
+    lon: +j[0].lon,
+    county: a.county || a.state || "",
+    municipality: a.municipality || a.city || a.town || a.village || ""
+  };
+}
+async function nominatimReverse(lat, lon){
+  const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&addressdetails=1`;
+  const r = await fetch(url, { headers: { "Accept":"application/json" }});
+  if(!r.ok) return { county:"", municipality:"" };
+  const j = await r.json();
+  const a = j?.address || {};
+  return {
+    county: a.county || a.state || "",
+    municipality: a.municipality || a.city || a.town || a.village || ""
+  };
+}
+
+/* ===== OSRM ===== */
+async function osrmSnapToRoad(lat, lon){
+  const url = `https://router.project-osrm.org/nearest/v1/driving/${lon},${lat}?number=1`;
+  const r = await fetch(url, { headers: { "Accept":"application/json" }});
+  if(!r.ok) return { lat, lon };
+  const j = await r.json();
+  const loc = j?.waypoints?.[0]?.location;
+  if(!loc) return { lat, lon };
+  return { lon: loc[0], lat: loc[1] };
+}
+async function driveMatrix(start, targets){
+  const coords = [
+    `${start.lon},${start.lat}`,
+    ...targets.map(t => `${t.lon},${t.lat}`)
+  ].join(";");
+  const dest = targets.map((_,i)=>i+1).join(";");
+  const url = `https://router.project-osrm.org/table/v1/driving/${coords}?sources=0&destinations=${dest}&annotations=duration,distance`;
+  const r = await fetch(url, { headers: { "Accept":"application/json" }});
+  if(!r.ok) throw new Error("Routing fel (OSRM)");
+  const j = await r.json();
+  const durations = j?.durations?.[0];
+  const distances = j?.distances?.[0];
+  if(!durations || !distances) throw new Error("OSRM gav inget svar");
+  return { durations, distances };
+}
+
+/* ===== Wikidata candidates (Sweden only) ===== */
+async function nearbyCandidates(lat, lon){
+  const sparql = `
+  SELECT ?placeLabel ?pop ?lat ?lon WHERE {
+    SERVICE wikibase:around {
+      ?place wdt:P625 ?coord.
+      bd:serviceParam wikibase:center "Point(${lon} ${lat})"^^geo:wktLiteral.
+      bd:serviceParam wikibase:radius "${RADIUS_KM}".
+    }
+    ?place wdt:P17 wd:Q34 .
+    VALUES ?type { wd:Q515 wd:Q3957 wd:Q532 wd:Q486972 wd:Q70208 }
+    ?place wdt:P31/wdt:P279* ?type.
+    ?place wdt:P1082 ?pop.
+    FILTER(?pop >= ${MIN_POP})
+    BIND(geof:latitude(?coord) AS ?lat)
+    BIND(geof:longitude(?coord) AS ?lon)
+    SERVICE wikibase:label { bd:serviceParam wikibase:language "sv,en". }
+  }`;
+  const url = "https://query.wikidata.org/sparql?format=json&query=" + encodeURIComponent(sparql);
+  const r = await fetch(url, { headers: { "Accept":"application/sparql-results+json" }});
+  if(!r.ok) throw new Error("Wikidata fel");
+  const j = await r.json();
+
+  return (j?.results?.bindings || []).map(b => ({
+    name: (b?.placeLabel?.value || "").trim(),
+    pop: parseInt(b?.pop?.value || "0", 10),
+    lat: parseFloat(b?.lat?.value),
+    lon: parseFloat(b?.lon?.value),
+  }))
+  .filter(x => x.name && Number.isFinite(x.pop) && Number.isFinite(x.lat) && Number.isFinite(x.lon))
+  .slice(0, WIKIDATA_LIMIT);
+}
+
+/* ===== Selection: farthest within window, pop as tiebreak ===== */
+async function pickFarthest(startInfo, inputName, candidates, durations, distances){
+  const county = startInfo.county;
+  const muni = n(startInfo.municipality);
+  const inputN = n(inputName);
+
+  // Gotland special
+  if (county === "Gotlands län") return { name:"Visby", meters:0 };
+
+  const maxTime = SPARSE_COUNTIES.has(county) ? MAX_SPARSE : MAX_DEFAULT;
+
+  // Stockholm special: choose farthest within 30–40 if possible
+  const isStockholm = county === "Stockholms län";
+
+  // Göteborg rule: only forbid Göteborg if customer in Göteborgs kommun
+  const forbidGbg = (muni === "göteborgs kommun");
+
+  const pool = [];
+  for (let i=0;i<candidates.length;i++){
+    const c = candidates[i];
+    const t = durations[i];
+    const d = distances[i];
+    if (!Number.isFinite(t) || !Number.isFinite(d)) continue;
+    if (t < 7*60) continue;
+    if (t > maxTime) continue;
+
+    const cN = n(c.name);
+    if (cN === inputN) continue;
+    if (forbidGbg && cN === "göteborg") continue;
+
+    pool.push({ c, t, d, idx:i });
+  }
+  if (!pool.length) return null;
+
+  // Keep only same county and different municipality (when possible)
+  // We'll do reverse on a shortlist (fast)
+  function sortFarthest(arr){
+    // farthest time first; tie -> pop; tie -> distance
+    return arr.sort((a,b)=>{
+      if (b.t !== a.t) return b.t - a.t;
+      if (b.c.pop !== a.c.pop) return b.c.pop - a.c.pop;
+      return b.d - a.d;
+    });
+  }
+
+  // Pick window preference
+  let preferred = [];
+  if (isStockholm){
+    preferred = pool.filter(x => x.t >= 30*60 && x.t <= 40*60);
+  } else {
+    // prefer ideal 30–45 but still choose farthest within that window
+    preferred = pool.filter(x => x.t >= IDEAL_MIN && x.t <= IDEAL_MAX);
+  }
+
+  const primary = sortFarthest(preferred.length ? preferred : pool).slice(0, 45);
+
+  for (const item of primary){
+    const rg = await nominatimReverse(item.c.lat, item.c.lon);
+    if (rg.county !== county) continue;
+    const rgM = n(rg.municipality);
+    // Try to avoid same municipality (not hard requirement everywhere)
+    if (rgM && muni && rgM === muni) continue;
+    return { name:item.c.name, meters:item.d };
+  }
+
+  // If municipality filtering killed everything, just take farthest
+  const fallback = sortFarthest(preferred.length ? preferred : pool)[0];
+  return { name: fallback.c.name, meters: fallback.d };
+}
+
+/* ===== Main ===== */
+async function findCity(){
+  try{
+    const fixed = getFixedFromUrl();
+    if (fixed) { show(fixed); return; }
+
+    const input = document.getElementById("city").value.trim();
+    if(!input) return;
+
+    show("Söker…");
+
+    const start = await nominatimSearch(input);
+    if (!start.county) throw new Error("Kunde inte läsa län (testa 'Ort, Sverige')");
+    if (start.county === "Gotlands län") { show("Visby"); return; }
+
+    let candidates = await nearbyCandidates(start.lat, start.lon);
+
+    // Candidate sampling: nearest first so we don't miss in-län towns, but selection will still pick farthest by time
+    candidates = candidates
+      .map(c => ({...c, _km: haversineKm(start.lat, start.lon, c.lat, c.lon)}))
+      .sort((a,b)=> a._km - b._km)
+      .slice(0, OSRM_TABLE_LIMIT);
+
+    const snapped = await osrmSnapToRoad(start.lat, start.lon);
+    const { durations, distances } = await driveMatrix({lat:snapped.lat, lon:snapped.lon}, candidates);
+
+    const best = await pickFarthest(start, input, candidates, durations, distances);
+    if(!best){ show("Ingen ort hittades"); return; }
+
+    show(`${best.name} – ca ${metersToKm(best.meters)} km`);
+  } catch(e){
+    show("Fel: " + (e?.message || String(e)));
+  }
+}
+</script>
+</body>
+</html>
